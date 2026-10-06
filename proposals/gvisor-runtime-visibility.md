@@ -3,6 +3,7 @@
 - **Status:** Proposed experiment
 - **Author:** Daksh Pathak (<daksh.pathak.ug24@nsut.ac.in>)
 - **Related work:** [Agent Sandbox CRD posture scanning](agent-sandbox-crd-scanning.md)
+- **Related runtime design:** [designs-and-proposals#14](https://github.com/kubescape/designs-and-proposals/pull/14)
 - **Initial implementation target:** [kubescape/node-agent](https://github.com/kubescape/node-agent)
 
 This document is based on published gVisor interfaces and the existing
@@ -41,6 +42,24 @@ sandbox was *defined* with the expected isolation, egress, and resource limits.
 They cannot answer whether a particular sandbox started, whether a source
 failed, or what traffic crossed the sandbox boundary. The two kinds of evidence
 should remain distinct in Kubescape's reports.
+
+### Relationship to the existing runtime proposal
+
+[PR #14](https://github.com/kubescape/designs-and-proposals/pull/14) already
+proposes gVisor's SecCheck remote sink for node-agent and reports a working
+proof of concept. This proposal is a narrower experiment companion, not a
+replacement design or a second receiver to deploy alongside it. It asks what
+can be established first from a verified start event, what sensitive fields
+the receiver must handle, and which stop and egress claims need separate
+evidence. PR #14 considers a broader mapping of syscall trace points into
+node-agent events; this proposal does not commit to that mapping.
+
+If PR #14 becomes the implementation design, its proof of concept is the
+starting point for the tests and privacy gates below. The two PRs should
+converge before node-agent integration, especially because gVisor currently
+permits only one `Default` trace session per sandbox. The earlier maintainer
+approval on PR #14 was [dismissed for LFX timing](https://github.com/kubescape/designs-and-proposals/pull/14#issuecomment-5324063216),
+not because its technical approach was rejected.
 
 The runtime gap is specific. gVisor's [networking guide](https://gvisor.dev/docs/user_guide/networking/)
 describes TCP state and packet assembly inside the Sentry's netstack. Its
@@ -136,6 +155,16 @@ pinned `runsc` build with `runsc trace metadata`:
 }
 ```
 
+Selecting only `container/start` does **not** mean the receiver sees only an
+ID. In gVisor's [root and child container start paths](https://github.com/google/gvisor/blob/8a2c5049262ca84ea9c0981ac82eed02110d4ba7/runsc/boot/loader.go),
+the event always includes `Args` and `Cwd`. Only `Env` is guarded by an
+optional-field setting. Arguments and working directories can contain
+credentials, so the receiver must treat the full incoming message as
+sensitive even though the proposed output keeps only verified identity and
+event metadata. If the requirement is to avoid receiving these fields at all,
+`container/start` is not an acceptable source and the experiment must choose
+a different point or signal.
+
 Configure this through `runsc --pod-init-config` so the session is present
 before the application starts. Attaching later with `runsc trace create` is a
 useful recovery test but cannot prove that early events were captured. The
@@ -223,9 +252,15 @@ The socket should have node-local ownership and restrictive permissions.
 Runtime setup must not grant node-agent broad access to `runsc`'s control root
 or to all sandbox sockets simply to receive events. If reconnection requires
 control-root access, that permission is a separate deployment and security
-decision, not an implicit part of the initial listener. No application
-environment, command arguments, or packet payloads are enabled in the first
-trace session.
+decision, not an implicit part of the initial listener. The first trace
+session does not request the optional environment field, extra context
+fields, or network points. It nevertheless receives `Args` and `Cwd` in every
+`container/start` message, including child containers. The receiver must
+discard both before logging, queuing, retaining experiment artifacts, or
+exporting an event. Error paths must not print or retain raw messages. Debug
+and strace logs used for comparison must be checked and sanitized before
+they are saved or shared. These controls limit retention and onward
+disclosure; they do not prevent receipt over the socket.
 
 The sink has retry and backoff settings. gVisor warns that excessive retries
 can delay application execution. The experiment will test a slow consumer and
@@ -244,12 +279,13 @@ happened.”
 | Normal exit and forced termination | Trace point, socket closure, CRI state | A stop is emitted only when a terminal source is independently verified |
 | Receiver absent, slow, and restarted | Startup result, drop counter, retry delay, recovery | Bounded resource use and explicit degraded state; no silent claim of complete coverage |
 | Malformed and oversized frames | Receiver errors and memory use | No crash, unbounded allocation, or effect on another connection |
+| Synthetic secret in root and child container argv and cwd | Canary in the test fixture; receiver logs, errors, queued events, metrics, exports, and retained receiver output | The receiver necessarily ingests the raw fields, but the canary appears nowhere in its retained or forwarded output; the fixture itself contains a harmless canary by design |
 | Controlled outbound, refused outbound, DNS | Trace fields and host packet comparison | Event name describes only the behavior actually observed |
 | Kubernetes node and managed GKE | Required runtime flags, socket path, permissions | Deployment instructions name only environments where setup was demonstrated |
 
-The experiment will retain a small, reproducible workload, receiver output,
-version list, and a table of expected versus observed events. If the remote
-sink cannot satisfy identity or reliability requirements, the design will
+The experiment will retain a small, reproducible workload, sanitized receiver
+output, version list, and a table of expected versus observed events. If the
+remote sink cannot satisfy identity or reliability requirements, the design will
 record that result and evaluate host boundary signals as a narrower fallback.
 It will not build a general node-agent adapter on an unverified source.
 
@@ -307,6 +343,7 @@ GKE deployment are stretch outcomes if the evidence supports them.
 - [gVisor runtime monitoring](https://gvisor.dev/docs/user_guide/runtimemonitor/)
 - [gVisor SecCheck points, sessions, and sink configuration](https://github.com/google/gvisor/blob/master/pkg/sentry/seccheck/README.md)
 - [gVisor remote sink protocol and security considerations](https://github.com/google/gvisor/blob/master/pkg/sentry/seccheck/sinks/remote/README.md)
+- [gVisor root and child `container/start` event construction](https://github.com/google/gvisor/blob/8a2c5049262ca84ea9c0981ac82eed02110d4ba7/runsc/boot/loader.go)
 - [gVisor debugging and strace logs](https://gvisor.dev/docs/user_guide/debugging/)
 - [gVisor observability and metrics](https://gvisor.dev/docs/user_guide/observability/)
 - [gVisor networking](https://gvisor.dev/docs/user_guide/networking/)
